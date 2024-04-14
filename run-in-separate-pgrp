@@ -1,65 +1,162 @@
 #!/usr/bin/env perl
-#
-# A wrapper tool which launches an arbitrary command in a newly created
-# foreground process group. This allows to limit the scope of Ctrl-C SIGINT
-# propagation to only the hierarchy of that new process group (terminals
-# propagate SIGINT to ALL processes of a foreground process group when Ctrl-C is
-# pressed, which may kill some intermediate processes like yarn).
-#
-# As an example, it's a work-around to let psql run in a yarn script (yarn dies
-# on SIGINT).
-#
-# See details here:
-# - https://www.postgresql.org/message-id/flat/271520.1713052173%40sss.pgh.pa.us#6ebc31cdb0365b0de9e0a2e7e5cb2268
-# - https://www.cons.org/cracauer/sigint.html
-#
+use warnings;
+use strict;
 use POSIX qw(tcgetpgrp tcsetpgrp WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
 
-if (!@ARGV) {
-  die("Usage: $0 command [args...]\n");
+# Signals to forward to the child process or group (if requested).
+my @FORWARDED_SIGNALS = qw(HUP INT QUIT USR1 USR2 PIPE TERM);
+
+# We replace SIGINT with SIGTERM when forwarding, because shells ignore SIGINT
+# before launching child processes in background ("When job control is not in
+# effect"): https://unix.stackexchange.com/a/652145
+my $SIGINT_REPLACEMENT = "TERM";
+
+#
+# Tool entry point.
+#
+sub main {
+  # Parse command line args.
+  my @args = @ARGV;
+  my $forward_signals_to = "";
+  my $print_signals = 0;
+  while (@args) {
+    if ($args[0] eq "--forward-signals-to-group") {
+      shift(@args);
+      $forward_signals_to = "group";
+      next;
+    } elsif ($args[0] eq "--forward-signals-to-child") {
+      shift(@args);
+      $forward_signals_to = "child";
+      next;
+    } elsif ($args[0] eq "--print-signals") {
+      shift(@args);
+      $print_signals = 1;
+      next;
+    } else {
+      last;
+    }
+  }
+
+  if (!@args) {
+    die(
+      "run-in-separate-pgrp - launch a command in a newly created foreground process group\n" .
+      "\n" .
+      "usage: $0 [--forward-signals-to-group | --forward-signals-to-child] [--print-signals] command [arg ...]\n"
+    );
+  }
+
+  my $is_in_tty_foreground = -t *STDIN && tcgetpgrp(0) == getpgrp(0);
+  if ($is_in_tty_foreground || $forward_signals_to eq "group") {
+    with_child($is_in_tty_foreground, $forward_signals_to, $print_signals, \@args);
+  } else {
+    without_child(\@args);
+  }
 }
 
-pipe(READER, WRITER) or die("pipe: $!\n");
-
-my $pid = fork();
-
-if (!defined($pid)) {
-  # Out of memory?
-  die("fork: $!\n");
-} elsif ($pid == 0) {
-  # Child process.
-  close(READER);
-  # The machinery: child process calls setpgrp(), but it can't call tcsetpgrp()
-  # since it must be done from the foreground process group (and after setpgrp()
-  # ends, the current pid's process group is not foreground anymore).
+#
+# Called when the launched program can just replace the current Perl process,
+# and there is no need in tcsetpgrp() call since we're not in foreground or not
+# in a TTY. This typically happens when the command is launched from some script
+# or receives its STDIN from a pipe, and the user doesn't request signals
+# forwarding to the subtree.
+#
+sub without_child {
+  my ($args) = @_;
   setpgrp($$, $$) or die("setpgrp: $!\n");
-  # Message the parent that it can now call tcsetpgrp() to make this child's new
-  # process group foreground.
-  syswrite(WRITER, "1");
-  close(WRITER);
-  # Replace our own process with the command's process.
-  exec(@ARGV) or die("exec: $!\n");
-} else {
-  # Parent process.
-  close(WRITER);
-  # Wait for the child process to finish the setpgrp() call.
-  sysread(READER, my $buf, 1);
-  close(READER);
-  # Assign the child's process group as foreground for the terminal, if there is
-  # terminal associated to STDIN, and the current process group is foreground.
-  if (-t STDIN && tcgetpgrp(STDIN) == getpgrp(0)) {
-    tcsetpgrp(STDIN, $pid) or die("tcsetpgrp $pid: $!\n");
-  }
-  # It's important to properly propagate the exit code and signal to the caller.
-  # I.e. if the wrapped command was killed with SIGTERM, the wrapper will also
-  # show itself terminated with SIGTERM.
-  wait();
-  my $code = ${^CHILD_ERROR_NATIVE};
-  if (WIFEXITED($code)) {
-    exit(WEXITSTATUS($code));
-  }
-  if (WIFSIGNALED($code)) {
-    kill(WTERMSIG($code), $$); # kill self with the same signal
-  }
-  exit($code >> 8);
+  run_exec(@$args);
 }
+
+#
+# Called when we need to launch the command in a child process and keep the
+# parent waiting doing some stuff, like calling tcsetpgrp() or forwarding
+# signals to the child/group.
+#
+sub with_child {
+  my ($is_in_tty_foreground, $forward_signals_to, $print_signals, $args) = @_;
+
+  pipe(*READER, *WRITER) or die("pipe: $!\n");
+  defined(my $pid = fork()) or die("fork: $!\n");
+
+  if ($pid == 0) {
+    # Child process: call setpgrp(), but we can't call tcsetpgrp() since it must
+    # be done from the foreground process group (and after setpgrp() ends, the
+    # current pid's process group is not foreground anymore).
+    close(*READER);
+    setpgrp($$, $$) or die("setpgrp: $!\n");
+    # Message the parent that it can now call tcsetpgrp() to make this child's new
+    # process group foreground.
+    syswrite(*WRITER, "1");
+    close(*WRITER);
+    # Replace our own (child's) process with the command's process.
+    run_exec(@$args);
+  } else {
+    # Parent process: wait for the child process to finish the setpgrp() call.
+    close(*WRITER);
+    sysread(*READER, my $buf, 1);
+    close(*READER);
+    # Assign the child's process group as foreground to the terminal.
+    if ($is_in_tty_foreground) {
+      tcsetpgrp(0, $pid) or die("tcsetpgrp $pid: $!\n");
+    }
+    # Forward signals received by this current script.
+    if ($forward_signals_to) {
+      setup_forward_signals($pid, $forward_signals_to, $print_signals, $is_in_tty_foreground);
+    }
+    # It's important to properly propagate the exit code and signal to the
+    # caller. I.e. if the wrapped command was killed with SIGTERM, the wrapper
+    # will also show itself terminated with SIGTERM.
+    wait();
+    my $code = ${^CHILD_ERROR_NATIVE};
+    if (WIFEXITED($code)) {
+      exit(WEXITSTATUS($code));
+    }
+    if (WIFSIGNALED($code)) {
+      for my $signal (@FORWARDED_SIGNALS) {
+        $SIG{$signal} = undef;
+      }
+      kill(WTERMSIG($code), $$); # kill self with the same signal
+    }
+    exit($code >> 8);
+  }
+}
+
+#
+# Traps signals and forwards them to the $pid process or group.
+#
+sub setup_forward_signals {
+  my ($pid, $forward_signals_to, $print_signals, $is_in_tty_foreground) = @_;
+  for my $signal (@FORWARDED_SIGNALS) {
+    $SIG{$signal} = sub {
+      my $kill_signal = $signal eq "INT" ? $SIGINT_REPLACEMENT : $signal;
+      my ($what, $ps_arg, $kill_id) = $forward_signals_to eq "group"
+        ? ("processes in the group $pid", "-g $pid", -$pid)
+        : ("child process $pid", "-p $pid", $pid);
+      if ($print_signals) {
+        my $ts = scalar(localtime);
+        my $msg = "run-in-separate-pgrp: received SIG$signal at $ts, killing $what with SIG$kill_signal";
+        my $pgrep_out = `pgrep -l -g $pid`;
+        if ($pgrep_out) {
+          $pgrep_out =~ s/\s+$//sg;
+          $pgrep_out =~ s/^/  /mg;
+          $msg .= ":\n$pgrep_out";
+        }
+        if ($is_in_tty_foreground) {
+          $msg = "\n$msg";
+        }
+        $msg =~ s/[\r\n]+$//sg;
+        print { \*STDERR } "$msg\n";
+      }
+      kill($kill_signal, $kill_id);
+    }
+  }
+}
+
+#
+# A shortcut to run exec() and handle errors.
+#
+sub run_exec {
+  my (@args) = @_;
+  exec(@args) or die("exec: $args[0]: $!\n");
+}
+
+main();

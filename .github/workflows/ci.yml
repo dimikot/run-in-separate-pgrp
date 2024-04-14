@@ -16,6 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: |
-          set -e -o pipefail
+          exec 2>&1; set -e -o pipefail
           cd tests
-          for f in *.sh; do echo "Running $f"; ./$f; done
+          for f in *.sh; do echo "## Running $f"; ./$f; echo; done
