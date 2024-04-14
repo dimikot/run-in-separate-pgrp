@@ -1,0 +1,21 @@
+name: CI Full Run
+on:
+  pull_request:
+    branches:
+      - main
+      - grok/*/*
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          set -e -o pipefail
+          cd tests
+          for f in *.sh; do echo "Running $f"; ./$f; done

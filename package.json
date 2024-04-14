@@ -1,0 +1,26 @@
+{
+  "name": "run-in-separate-pgrp",
+  "description": "Launch a console command in a newly created foreground process group",
+  "version": "1.0.3",
+  "license": "MIT",
+  "keywords": [
+    "pgrp",
+    "pgid",
+    "process group",
+    "setpgrp",
+    "tcsetpgrp",
+    "sigint"
+  ],
+  "bin": {
+    "run-in-separate-pgrp": "./run-in-separate-pgrp"
+  },
+  "scripts": {
+    "test-psql-unwrapped": "echo 'Press ^C: it will kill psql, which is bad.'; echo; psql",
+    "test-psql": "echo 'Press ^C: it will NOT kill psql, which is good!'; echo; ./run-in-separate-pgrp psql",
+    "deploy": "npm publish --access=public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/dimikot/run-in-separate-pgrp"
+  }
+}
