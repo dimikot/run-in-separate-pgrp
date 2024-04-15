@@ -128,17 +128,23 @@ sub setup_forward_signals {
   for my $signal (@FORWARDED_SIGNALS) {
     $SIG{$signal} = sub {
       my $kill_signal = $signal eq "INT" ? $SIGINT_REPLACEMENT : $signal;
-      my ($what, $ps_arg, $kill_id) = $forward_signals_to eq "group"
+      my ($what, $pgrep_arg, $kill_id) = $forward_signals_to eq "group"
         ? ("processes in the group $pid", "-g $pid", -$pid)
-        : ("child process $pid", "-p $pid", $pid);
+        : ("child process $pid", undef, $pid);
       if ($print_signals) {
         my $ts = scalar(localtime);
         my $msg = "run-in-separate-pgrp: received SIG$signal at $ts, killing $what with SIG$kill_signal";
-        my $pgrep_out = `pgrep -l -g $pid`;
+        # Note: ps tool doesn't support -g across platforms, so we use pgrep to
+        # get the list of process ids and then ps to print nice command lines.
+        my $pgrep_out = $pgrep_arg ? `pgrep $pgrep_arg` : "$pid";
         if ($pgrep_out) {
-          $pgrep_out =~ s/\s+$//sg;
-          $pgrep_out =~ s/^/  /mg;
-          $msg .= ":\n$pgrep_out";
+          $pgrep_out =~ s/\s+/ /sg;
+          $pgrep_out =~ s/^\s+|\s+$//sg;
+          my $ps_out = `ps -o pid,sess,pgid,command -p $pgrep_out`;
+          if ($ps_out) {
+            $ps_out =~ s/\s+$//sg;
+            $msg .= ":\n$ps_out";
+          }
         }
         if ($is_in_tty_foreground) {
           $msg = "\n$msg";
