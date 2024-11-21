@@ -1,7 +1,7 @@
 {
   "name": "run-in-separate-pgrp",
   "description": "Launch a console command in a newly created foreground process group",
-  "version": "1.1.0",
+  "version": "1.2.1",
   "license": "MIT",
   "keywords": [
     "pgrp",
@@ -15,10 +15,10 @@
     "run-in-separate-pgrp": "./run-in-separate-pgrp"
   },
   "scripts": {
-    "test-psql-unwrapped": "echo 'Press ^C: it will kill psql, which is bad.'; echo; exec psql",
+    "test-psql-unwrapped": "echo 'Press ^C: it will kill \"yarn psql\", which is bad.'; echo; exec psql",
     "test-psql-no-forward": "echo 'Press ^C: it will NOT kill psql, which is good!'; echo; exec ./run-in-separate-pgrp psql",
     "test-psql": "echo 'Press ^C: it will NOT kill psql, which is good!'; echo; exec ./run-in-separate-pgrp --forward-signals-to-group --print-signals psql",
-    "test-sleep": "exec ./run-in-separate-pgrp --forward-signals-to-group --print-signals bash -c 'sleep 100 & sleep 200 & sleep 300'",
+    "test-sleep": "echo 'Run \"killall -TERM perl\" in another console...'; echo; exec ./run-in-separate-pgrp --forward-signals-to-group --print-signals bash -c 'sleep 100 & sleep 200 & sleep 300'",
     "test-watch": "watch -n0.5 'pstree | grep -E \"psql|perl|sleep\" | grep -v grep'",
     "deploy": "npm publish --access=public"
   },

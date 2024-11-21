@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 use warnings;
 use strict;
-use POSIX qw(tcgetpgrp tcsetpgrp WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG);
+use POSIX qw(tcgetpgrp tcsetpgrp WIFEXITED WEXITSTATUS WIFSIGNALED WIFSTOPPED WTERMSIG WUNTRACED);
 
 # Signals to forward to the child process or group (if requested).
 my @FORWARDED_SIGNALS = qw(HUP INT QUIT USR1 USR2 PIPE TERM);
@@ -75,7 +75,7 @@ sub with_child {
   my ($is_in_tty_foreground, $forward_signals_to, $print_signals, $args) = @_;
 
   pipe(*READER, *WRITER) or die("pipe: $!\n");
-  defined(my $pid = fork()) or die("fork: $!\n");
+  defined(our $pid = fork()) or die("fork: $!\n");
 
   if ($pid == 0) {
     # Child process: call setpgrp(), but we can't call tcsetpgrp() since it must
@@ -83,10 +83,12 @@ sub with_child {
     # current pid's process group is not foreground anymore).
     close(*READER);
     setpgrp($$, $$) or die("setpgrp: $!\n");
+
     # Message the parent that it can now call tcsetpgrp() to make this child's new
     # process group foreground.
     syswrite(*WRITER, "1");
     close(*WRITER);
+
     # Replace our own (child's) process with the command's process.
     run_exec(@$args);
   } else {
@@ -94,19 +96,54 @@ sub with_child {
     close(*WRITER);
     sysread(*READER, my $buf, 1);
     close(*READER);
-    # Assign the child's process group as foreground to the terminal.
+
+    # Assign the child's process group as foreground to the terminal, so that child
+    # will be receiving ^C, ^Z etc.
+    our $old_tcpgrp = 0;
     if ($is_in_tty_foreground) {
+      $old_tcpgrp = tcgetpgrp(0);
+      !defined($old_tcpgrp) || $old_tcpgrp == -1 and $old_tcpgrp = 0;
+      # Tell OS that ^C, ^Z etc. should be received by $pid pgrp (i.e. set
+      # $pid pgrp to control the terminal).
       tcsetpgrp(0, $pid) or die("tcsetpgrp $pid: $!\n");
+      # If we got resumed (e.g. by "fg" in the shell), resume the child as well.
+      $SIG{CONT} = sub { tcsetpgrp(0, $pid) and kill("CONT", -$pid) };
+      # When the child and/or script exits, restore terminal controlling group
+      # to the prev value. If we don't do it, all ^C signals will be lost, since
+      # the terminal will try to deliver them to a dead child.
+      END {
+        if ($old_tcpgrp && tcgetpgrp(0) == $pid) {
+          $SIG{TTOU} = 'IGNORE';
+          tcsetpgrp(0, $old_tcpgrp) or die("tcsetpgrp $old_tcpgrp (restoring prev tcpgrp): $!\n");
+        }
+      }
     }
-    # Forward signals received by this current script.
+
+    # Forward signals received by this current script to the child.
     if ($forward_signals_to) {
       setup_forward_signals($pid, $forward_signals_to, $print_signals, $is_in_tty_foreground);
     }
+
+    # Loop until the child exits.
+    my $code;
+    while (1) {
+      waitpid(-1, WUNTRACED);
+      $code = ${^CHILD_ERROR_NATIVE};
+      if (WIFSTOPPED($code)) {
+        # Child received ^Z: stop ourselves as if it were us who received ^Z.
+        if ($old_tcpgrp && tcgetpgrp(0) == $pid) {
+          kill("STOP", -$old_tcpgrp);
+        }
+        next;
+      } else {
+        # Child exited or doesn't exist anymore.
+        last;
+      }
+    }
+
     # It's important to properly propagate the exit code and signal to the
     # caller. I.e. if the wrapped command was killed with SIGTERM, the wrapper
     # will also show itself terminated with SIGTERM.
-    wait();
-    my $code = ${^CHILD_ERROR_NATIVE};
     if (WIFEXITED($code)) {
       exit(WEXITSTATUS($code));
     }
